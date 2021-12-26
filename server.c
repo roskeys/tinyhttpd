@@ -14,12 +14,15 @@
 #define SERVER_STRING "Server: myhttpd/0.1.0\r\n"
 
 void response_code(int, const char *);
-void headers(int, const char *);
+void headers(int);
 void read_file(int, FILE *);
 void not_found(int, const char *);
+void bad_request(int);
 void unimplemented(int);
+void internal_server_error(int);
 void serve_file(int, const char *);
 void handle_connection(void *);
+void execute(int, const char *, const char *, const char *);
 int get_line(int, char *, int);
 
 void response_code(int client, const char *status)
@@ -30,11 +33,10 @@ void response_code(int client, const char *status)
     send(client, buf, strlen(buf), 0);
 }
 
-void headers(int client, const char *filename)
+void headers(int client)
 {
     char buf[1024];
     memset(buf, 0, sizeof(buf));
-    (void)filename;
     sprintf(buf, "%sContent-Type: text/html\r\n\r\n", SERVER_STRING);
     send(client, buf, strlen(buf), 0);
 }
@@ -58,7 +60,7 @@ void not_found(int client, const char *path)
 {
     printf("[INFO] File not found %s\n", path);
     response_code(client, "404 NOT FOUND");
-    headers(client, path);
+    headers(client);
     FILE *file_404 = fopen("www/404.html", "r");
     if (file_404 != NULL)
     {
@@ -66,19 +68,40 @@ void not_found(int client, const char *path)
     }
 }
 
+void internal_server_error(int client)
+{
+    printf("[INFO] Internal Server Error\n");
+    response_code(client, "500 Internal Server Error");
+    headers(client);
+    FILE *file_50x = fopen("www/500.html", "r");
+    if (file_50x != NULL)
+    {
+        read_file(client, file_50x);
+    }
+}
+
+void bad_request(int client)
+{
+    printf("[INFO] Bad request\n");
+    response_code(client, "400 Bad request");
+    headers(client);
+    FILE *file_40x = fopen("www/400.html", "r");
+    if (file_40x != NULL)
+    {
+        read_file(client, file_40x);
+    }
+}
+
 void unimplemented(int client)
 {
-    char buf[1024];
-    memset(buf, 0, sizeof(buf));
-    sprintf(buf, "HTTP/1.0 501 Method Not Implemented\r\n"
-                 "Server: %s"
-                 "Content-Type: text/html\r\n\r\n"
-                 "<HTML>"
-                 "<HEAD><TITLE>Method Not Implemented</TITLE></HEAD>"
-                 "<BODY><h1>HTTP request method not supported.</h1></BODY>"
-                 "</HTML>\r\n\r\n",
-            SERVER_STRING);
-    send(client, buf, strlen(buf), 0);
+    printf("[INFO] Method not implemented\n");
+    response_code(client, "501 Method Not Implemented");
+    headers(client);
+    FILE *file_50x = fopen("www/501.html", "r");
+    if (file_50x != NULL)
+    {
+        read_file(client, file_50x);
+    }
 }
 
 void serve_file(int client, const char *filename)
@@ -93,7 +116,7 @@ void serve_file(int client, const char *filename)
     {
         printf("[INFO] Serve file %s\n", filename);
         response_code(client, "200 OK");
-        headers(client, filename);
+        headers(client);
         read_file(client, file);
     }
     fclose(file);
@@ -123,7 +146,7 @@ int get_line(int sock, char *buf, int size)
 
 void handle_connection(void *arg)
 {
-    int client = (intptr_t)arg, n;
+    int client = (intptr_t)arg, n, exec = 0;
     struct stat st;
     size_t i, j;
     char buf[1024];
@@ -132,6 +155,7 @@ void handle_connection(void *arg)
     memset(buf, 0, sizeof(buf));
     memset(url, 0, sizeof(url));
     memset(method, 0, sizeof(method));
+    char *query_string = NULL;
 
     // get first line GET / HTTP/1.1
     n = get_line(client, buf, sizeof(buf));
@@ -152,6 +176,11 @@ void handle_connection(void *arg)
         return;
     }
 
+    if (strcasecmp(method, "POST") == 0)
+    {
+        exec = 1;
+    }
+
     // remove the space after method
     while (isspace((int)buf[j]) && j < sizeof(buf))
     {
@@ -166,6 +195,20 @@ void handle_connection(void *arg)
         i++;
         j++;
     }
+
+    // extract the query string
+    query_string = url;
+    while ((*query_string != '?') && (*query_string != '\0'))
+    {
+        query_string++;
+    }
+    if (*query_string == '?')
+    {
+        exec = 1;
+        *query_string = '\0';
+        query_string++;
+    }
+
     url[i] = '\0';
     if (strcmp(url, "/") == 0 && strlen(url) == 1)
     {
@@ -176,19 +219,144 @@ void handle_connection(void *arg)
         sprintf(path, "www%s", url);
     }
 
-    while (n > 0 && strcmp("\r\n", buf))
-    {
-        n = get_line(client, buf, sizeof(buf));
-    }
-
     printf("[INFO] Path:%s\n", path);
     if (stat(path, &st) == -1)
     {
+        // abandon the headers
+        while (n > 0 && strcmp("\r\n", buf))
+        {
+            n = get_line(client, buf, sizeof(buf));
+        }
         not_found(client, path);
     }
     else
     {
-        serve_file(client, path);
+        if ((st.st_mode & S_IXUSR) || (st.st_mode & S_IXGRP) || (st.st_mode & S_IXOTH))
+        {
+            exec = 1;
+        }
+        if (!exec)
+        {
+            // abandon the headers
+            while (n > 0 && strcmp("\r\n", buf))
+            {
+                n = get_line(client, buf, sizeof(buf));
+            }
+            serve_file(client, path);
+        }
+        else
+        {
+            execute(client, path, method, query_string);
+        }
+    }
+    close(client);
+}
+
+void execute(int client, const char *path, const char *method, const char *query_string)
+{
+    char buf[1024];
+    pid_t pid;
+    int n = 1, content_length = -1, status;
+    int output[2], input[2];
+
+    if (strcasecmp(method, "GET") == 0)
+    {
+        while (n > 0 && strcmp("\r\n", buf) == 0)
+        {
+            n = get_line(client, buf, sizeof(buf));
+        }
+    }
+    else
+    {
+        do
+        {
+            n = get_line(client, buf, sizeof(buf));
+            buf[15] = '\0';
+            if (strcasecmp(buf, "Content-Length:") == 0)
+            {
+                content_length = atoi(&(buf[16]));
+            }
+        } while (n > 0 && strcmp("\r\n", buf));
+        if (content_length == -1)
+        {
+            bad_request(client);
+            return;
+        }
+    }
+
+    if (pipe(output) < 0)
+    {
+        internal_server_error(client);
+        return;
+    }
+    if (pipe(input) < 0)
+    {
+        internal_server_error(client);
+        return;
+    }
+
+    if ((pid = fork()) < 0)
+    {
+        internal_server_error(client);
+        return;
+    }
+
+    if (pid == 0)
+    {
+        // child process
+        dup2(output[1], 1); //1代表着stdout，0代表着stdin
+        dup2(input[0], 0);
+        close(output[0]);
+        close(input[1]);
+
+        char method_env[256];
+        char query_env[256];
+        char length_env[256];
+
+        memset(method_env, 0, sizeof(method_env));
+        memset(query_env, 0, sizeof(query_env));
+        memset(length_env, 0, sizeof(length_env));
+
+        sprintf(method_env, "REQUEST_METHOD=%s", method);
+        putenv(method_env);
+
+        if (strcasecmp(method, "GET") == 0) {
+            sprintf(query_env, "QUERY_STRING=%s", query_string);
+            putenv(query_env);
+        } else{
+            sprintf(length_env, "CONTENT_LENGTH=%d", content_length);
+            putenv(length_env);
+        }
+
+        int result = execl(path, path, NULL);
+        exit(0);
+    } else {
+        // parent process
+        close(output[1]);
+        close(input[0]);
+        if (strcasecmp(method, "POST") == 0)
+        {
+            int sum=0;
+            while (sum < content_length)
+            {
+                memset(buf, 0, sizeof(buf));
+                n = recv(client, &buf, sizeof(buf), 0);
+                write(input[1], buf, n);
+                sum += n;
+            }
+        }
+
+        response_code(client, "200 OK");
+        headers(client);
+        while (read(output[0], buf, sizeof(buf)) > 0)
+        {
+            send(client, buf, strlen(buf), 0);
+            memset(buf, 0, sizeof(buf));
+        }
+
+        close(output[0]);
+        close(input[1]);
+        waitpid(pid, &status, 0);
     }
     close(client);
 }
@@ -197,14 +365,14 @@ int main(int argc, char const *argv[])
 {
     pthread_t thread;
     u_short port = 8080;
-    char *host = "127.0.0.1";
+    char *host = "0.0.0.0";
     if (2 == argc)
     {
         port = strtol(argv[1], NULL, 10);
     }
     if (3 == argc)
     {
-        host = (char*)argv[1];
+        host = (char *)argv[1];
         port = strtol(argv[2], NULL, 10);
     }
     int sockfd, client = -1;

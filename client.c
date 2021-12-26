@@ -50,14 +50,16 @@ int main(int argc, char const *argv[])
     printf("[INFO] Connected:\n");
     char message[1024];
     char buf[1024];
-    sprintf(message, "GET / HTTP/1.1\r\n"
+    sprintf(message, "POST /date.cgi HTTP/1.1\r\n"
                      "Host: %s:%d\r\n"
                      "Upgrade-Insecure-Requests: 1\r\n"
+                     "Content-Length: 10"
                      "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/95.0.4638.54 Safari/537.36\r\n"
                      "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9\r\n"
                      "Accept-Encoding: gzip, deflate\r\n"
                      "Accept-Language: zh-CN,zh;q=0.9\r\n"
-                     "Connection: close\r\n\r\n",
+                     "Connection: close\r\n\r\n"
+                     "color=gray",
             host, port);
     send(sock, message, strlen(message), 0);
     int n;
